@@ -2,18 +2,22 @@
 import os
 from datetime import datetime, timedelta
 import certifi
-from flask import Flask, render_template, request, redirect, url_for
+from flask import Flask, render_template, request, redirect, url_for, flash, session
+from flask_login import LoginManager, UserMixin, login_user, current_user, login_required, logout_user
 import pymongo
 from bson.objectid import ObjectId
 from dotenv import load_dotenv, dotenv_values
+from werkzeug.security import check_password_hash, generate_password_hash
 
-load_dotenv(dotenv_path='static/.env')  # load environment variables from .env file
+load_dotenv()  # load environment variables from .env file
 
 
 def create_app():
     app = Flask(__name__)
-    app.config['TEMPLATES_AUTO_RELOAD'] = True
+    secret_key = load_dotenv("SECRET_KEY")
 
+    app.config['TEMPLATES_AUTO_RELOAD'] = True
+    app.config['SEND_FILE_MAX_AGE_DEFAULT'] = 0
 
     config = dotenv_values()
     app.config.from_mapping(config)
@@ -28,31 +32,128 @@ def create_app():
     except Exception as e:
         print(" * MongoDB connection error:", e)
 
-    # ObjectId of current logged in user. Will have to fetch this with pymongo commands later
-    loggedUser = ObjectId('67bd0feb736f2e7829d2dbe9')
+    #Login
+    users_collection = db["Users"]
+    login_manager = LoginManager()
+    login_manager.init_app(app)
+    login_manager.login_view = 'login'
+
+    class User(UserMixin):
+
+        def __init__(self, user_id, username, is_active=True):
+            self.id = str(user_id)
+            self.username = username
+            self._is_active = is_active
+
+        def is_active(self):
+            return self._is_active
+
+        def is_authenticated(self):
+            return self.is_authenticated
+
+        def get_id(self):
+            return self.id
+
+    @login_manager.user_loader
+    def load_user(user_id):
+        user = users_collection.find_one({"_id": ObjectId(user_id)})
+        if user:
+            return User(user_id=user["_id"],
+                        username=user["username"],
+                        is_active=True)
+        else:
+            return None
 
     # landing page
     @app.route('/')
+    @login_required
     def landing():
         return render_template("landing.html")
 
     # login page
-    @app.route('/login')
+    @app.route('/login', methods=['GET', 'POST'])
     def login():
+        if request.method == "POST":
+            username = request.form.get("username")
+            password = request.form.get("password")
+
+            #check database for username
+            user_data = users_collection.find_one({"username": username})
+            if user_data:
+                #check database for password
+                if check_password_hash(user_data["password"], password):
+                    #Create User instance (flask-login)
+                    user = User(user_id=user_data["_id"],
+                                username=user_data["username"],
+                                is_active=True)
+
+                    session["user_id"] = str(user_data["_id"])
+
+                    login_user(user)
+                    flash("Logged in successfully!", "success")
+                    return redirect("/home")
+                else:
+                    flash("Invalid username or password.", "danger")
+            else:
+                flash("Invalid username or password.", "danger")
+
+            # If login failed, re-render the login form
+            return render_template("login.html")
         return render_template("login.html")
 
     # signup page
-    @app.route('/signup')
+    @app.route('/signup', methods=['GET', 'POST'])
     def signup():
+        if request.method == "POST":
+            username = request.form.get("username")
+            password = request.form.get("password")
+
+            # Check if the username already exists in the database.
+            if users_collection.find_one({"username": username}):
+                flash("Username already exists. Please choose another.",
+                      "danger")
+                return render_template("signup.html")
+
+            # hash password for security
+            hashed_password = generate_password_hash(password, method='md5')
+
+            #insert into database
+            insert_result = users_collection.insert_one({
+                "username":
+                username,
+                "password":
+                hashed_password
+            })
+            user_id = insert_result.inserted_id
+
+            #check that insert succesful
+            if user_id:
+                flash("Account created successfully!", "success")
+                return redirect("/login")
+            else:
+                flash("An error occurred during signup. Please try again.",
+                      "danger")
         return render_template("signup.html")
 
-    # home page
-    @app.route('/home')
-    def home():
-        # calculations for dashboard
+    @app.route('/addapplication')
+    @login_required
+    def addapplication():
+        current_date = datetime.now().strftime("%B %d, %Y")
+        return render_template('addapplication.html',
+                               current_date=current_date)
 
+    @app.route('/addnew')
+    @login_required
+    def addnew():
+        return render_template('addnew.html')
+
+    # home dashboard page
+    @app.route('/home')
+    @login_required
+    def home():
         # finding total apps of user
-        total = db.Apps.count_documents({"user": loggedUser})
+        total = db.Apps.count_documents(
+            {"user": ObjectId(session.get("user_id"))})
 
         # calculating dates
         today = datetime.now()
@@ -68,13 +169,15 @@ def create_app():
             "date": {
                 "$gte": iso_week
             },
-            "user": loggedUser
+            "user":
+            ObjectId(session.get("user_id"))
         })
         docs_month_cursor = db.Apps.find({
             "date": {
                 "$gte": iso_month
             },
-            "user": loggedUser
+            "user":
+            ObjectId(session.get("user_id"))
         })
 
         # convert to lists
@@ -82,69 +185,90 @@ def create_app():
         docs_month = list(docs_month_cursor)
 
         # finding number of apps based on status
-        accepted = list(
-            db.Apps.find({
-                "status": "Accepted",
-                "user": loggedUser
-            }))
-        interviewing = list(
-            db.Apps.find({
-                "status": "Interviewing",
-                "user": loggedUser
-            }))
-        rejected = list(
-            db.Apps.find({
-                "status": "Rejected",
-                "user": loggedUser
-            }))
+        accepted = db.Apps.count_documents({
+            "status":
+            "Accepted",
+            "user":
+            ObjectId(session.get("user_id"))
+        })
+        interviewing = db.Apps.count_documents({
+            "status":
+            "Interviewing",
+            "user":
+            ObjectId(session.get("user_id"))
+        })
+        rejected = db.Apps.count_documents({
+            "status":
+            "Rejected",
+            "user":
+            ObjectId(session.get("user_id"))
+        })
+
+        # finding current logged user for name
+        user = db.Users.find_one({"_id": ObjectId(session.get("user_id"))})
 
         return render_template("home.html",
+                               user=user,
                                week=len(docs_week),
                                month=len(docs_month),
                                total=total,
-                               accepted=len(accepted),
-                               interviewing=len(interviewing),
-                               rejected=len(rejected))
-
-    # edit profile page
-    @app.route('/edit-profile', methods=['GET', 'POST'])
-    def edit_profile():
-        user = db.Users.find_one({"_id": loggedUser})
-
-        # post request
-        if request.method == 'POST':
-            new_name = request.form.get('newUsername')
-
-            # update the database
-            db.Users.update_one({"_id": ObjectId(loggedUser)},
-                                {"$set": {
-                                    "username": new_name
-                                }})
-
-            return redirect(url_for('edit_profile'))
-
-        # get request
-        return render_template("edit-profile.html", user=user)
+                               accepted=accepted,
+                               interviewing=interviewing,
+                               rejected=rejected)
 
     # job tracking page
     @app.route('/track', methods=['GET', 'POST'])
+    @login_required
     def track():
         # post request
         if request.method == 'POST':
             # get user input from search bar
-            search_query = request.form.get('search')
+            choice = request.form.get('status')
 
-            # search applications based on input (just company name for now)
-            applications = db.Apps.find({
-                "user": loggedUser,
-                "company": search_query
-            })
+            if 'applied' in choice.lower() or 'interview' in choice.lower(
+            ) or 'rejected' in choice.lower() or 'offer' in choice.lower():
+                applications = db.Apps.find({
+                    "user":
+                    ObjectId(session.get("user_id")),
+                    "status":
+                    choice
+                })
+            elif choice.lower() == 'descending':
+                applications = db.Apps.find({
+                    "user":
+                    ObjectId(session.get("user_id"))
+                }).sort("date", -1)
+            elif choice.lower() == 'ascending':
+                applications = db.Apps.find({
+                    "user":
+                    ObjectId(session.get("user_id"))
+                }).sort("date", 1)
 
             return render_template("track.html", applications=applications)
 
         # get request
-        applications = db.Apps.find({"user": loggedUser})
+        applications = db.Apps.find({"user": ObjectId(session.get("user_id"))})
         return render_template("track.html", applications=applications)
+
+    # delete app
+    @app.route('/delete', methods=['GET', 'POST'])
+    @login_required
+    def delete():
+        # post request
+        # if request.method == 'POST':
+        db.Apps.delete_one({"_id": ObjectId('67bdf16a3028f7eee227824d')})
+
+        applications = db.Apps.find({"user": ObjectId(session.get("user_id"))})
+        return render_template("delete.html", applications=applications)
+
+    @app.route('/logout')
+    @login_required
+    def logout():
+        logout_user()
+        session.pop('_flashes', None)
+        session.pop("user_id", None)
+        flash("You have been logged out.", "info")
+        return redirect(url_for('login'))
 
     @app.errorhandler(Exception)
     def handle_error(e):
@@ -166,4 +290,5 @@ if __name__ == "__main__":
     FLASK_PORT = os.getenv("FLASK_PORT", "5000")
     FLASK_ENV = os.getenv("FLASK_ENV")
     print(f"FLASK_ENV: {FLASK_ENV}, FLASK_PORT: {FLASK_PORT}")
-    app.run(port=FLASK_PORT, debug=True)
+
+    app.run(port=FLASK_PORT)
